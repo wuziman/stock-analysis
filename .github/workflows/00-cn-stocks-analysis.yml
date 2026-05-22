@@ -1,0 +1,87 @@
+name: A股分析（比亚迪/北方稀土）
+
+on:
+  schedule:
+    - cron: '0 10 * * 1-5'       # 北京时间 18:00 (UTC 10:00)，周一至周五
+  workflow_dispatch:
+
+concurrency:
+  group: cn-stock-analysis
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 创建必要目录
+        run: mkdir -p data logs reports
+
+      - name: 录入持仓成本价
+        run: |
+          python -c "
+          import os, sqlite3
+          prices = os.environ.get('PORTFOLIO_COST_PRICES', '')
+          if prices:
+              db = sqlite3.connect('data/stock_analysis.db')
+              c = db.cursor()
+              c.execute('CREATE TABLE IF NOT EXISTS portfolio_accounts (id INTEGER PRIMARY KEY, owner_id VARCHAR(64), name VARCHAR(64), broker VARCHAR(64), market VARCHAR(8), base_currency VARCHAR(8), is_active BOOLEAN DEFAULT 1, created_at DATETIME, updated_at DATETIME)')
+              c.execute('CREATE TABLE IF NOT EXISTS portfolio_position_lots (id INTEGER PRIMARY KEY, account_id INTEGER, cost_method VARCHAR(8) DEFAULT \'FIFO\', symbol VARCHAR(16), market VARCHAR(8), currency VARCHAR(8) DEFAULT \'CNY\', open_date DATE, remaining_quantity FLOAT, unit_cost FLOAT, source_trade_id INTEGER, updated_at DATETIME)')
+              c.execute('INSERT OR IGNORE INTO portfolio_accounts (id, owner_id, name, market, base_currency, is_active, created_at) VALUES (1, \'default\', \'默认账户\', \'A\', \'CNY\', 1, date(\'now\'))')
+              db.commit()
+              for entry in prices.split(','):
+                  if ':' in entry:
+                      symbol, cost = entry.split(':')
+                      c.execute('SELECT id FROM portfolio_position_lots WHERE symbol=? AND account_id=1', (symbol.strip(),))
+                      row = c.fetchone()
+                      if row:
+                          c.execute('UPDATE portfolio_position_lots SET unit_cost=?, remaining_quantity=100, updated_at=date(\'now\') WHERE id=?', (float(cost), row[0]))
+                      else:
+                          c.execute('INSERT INTO portfolio_position_lots (account_id, cost_method, symbol, market, currency, open_date, remaining_quantity, unit_cost) VALUES (1, \'FIFO\', ?, \'A\', \'CNY\', date(\'now\'), 100, ?)', (symbol.strip(), float(cost)))
+              db.commit()
+              db.close()
+              print(f'持仓成本已录入: {prices}')
+          else:
+              print('无需录入持仓成本')
+          "
+        env:
+          PORTFOLIO_COST_PRICES: ${{ secrets.PORTFOLIO_COST_PRICES }}
+
+      - name: 执行A股分析
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
+          STOCK_LIST: ${{ secrets.CN_STOCK_LIST }}
+          MARKET_REVIEW_REGION: cn
+          USE_PROXY: 'false'
+          MAX_WORKERS: '1'
+          REPORT_TYPE: simple
+          LOG_LEVEL: INFO
+        run: |
+          echo "===== A股分析 ====="
+          echo "自选股: $STOCK_LIST"
+          echo "推送渠道: Server酱3"
+          python main.py
+
+      - name: 上传分析报告
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: cn-analysis-reports-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
